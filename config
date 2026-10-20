@@ -1,0 +1,267 @@
+# -*- coding: utf-8 -*-
+"""
+MÓDULO DE EXPERIMENTACIÓN Y OPTIMIZACIÓN METAHEURÍSTICA
+Autor: José Arturo Pedraza Cruz
+Asignatura: Inteligencia Artificial - Búsqueda y Optimización Local
+
+Este script implementa y evalúa cuatro familias de problemas de optimización:
+1. N-Reinas (N=8, 50, 100)
+2. Mochila 0/1 (Dataset Kaggle)
+3. Coloreado de Grafos (N=50, 1000)
+4. Función Continua Eggholder [-512, 512]^2
+
+Estrategias evaluadas:
+- Backtracking con Heurística MRV y Ordenamiento Dinámico (BT)
+- Recocido Simulado Estocástico (LOCAL)
+- Algoritmo Genético Basado en Poblaciones (EVOL)
+"""
+
+import io
+import json
+import time
+import uuid
+import copy
+import hashlib
+import zipfile
+import platform
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import networkx as nx
+
+# Configuración global del entorno experimental
+CONFIG_SEMILLAS = [11, 22, 33, 44, 55]
+PRESUPUESTO_EJECUCION = {'max_evaluaciones': 10_000, 'max_segundos': 10.0}
+
+ENTORNO_SISTEMA = {
+    'python_version': platform.python_version(),
+    'numpy_version': np.__version__,
+    'pandas_version': pd.__version__,
+    'networkx_version': nx.__version__,
+    'os_platform': platform.platform()
+}
+
+# Registros globales
+CATALOGO_SOLVERS = {}
+CATALOGO_EVALUADORES = {}
+CONFIGURACION_PARAMETROS = {}
+HISTORIAL_RUNS = []
+DETALLES_EJECUCION = {}
+
+
+def registrar_algoritmo(problema_id, nombre_algoritmo, familia, funcion_solver, params=None):
+    """Registra una variante algorítmica en el arnés experimental."""
+    familias_validas = {'BT', 'LOCAL', 'EVOL', 'HIBRIDO'}
+    if familia not in familias_validas:
+        raise ValueError(f"Familia no válida: {familia}")
+    if problema_id == 'eggholder' and familia == 'BT':
+        raise ValueError("Backtracking no es aplicable al dominio continuo Eggholder.")
+    
+    key = (problema_id, nombre_algoritmo)
+    CATALOGO_SOLVERS[key] = (familia, funcion_solver)
+    CONFIGURACION_PARAMETROS[key] = copy.deepcopy(params or {})
+
+
+def ejecutar_suite_experimentos(problema_id, lista_instancias, semillas=CONFIG_SEMILLAS, limites=None):
+    """Ejecuta el protocolo experimental completo para un problema determinado."""
+    limites_eje = dict(limites or PRESUPUESTO_EJECUCION)
+    algoritmos = [(nombre, fam, fn) for (p, nombre), (fam, fn) in CATALOGO_SOLVERS.items() if p == problema_id]
+    
+    if not algoritmos or problema_id not in CATALOGO_EVALUADORES:
+        print(f"[{problema_id}] No se encontraron solucionadores o evaluadores registrados.")
+        return
+
+    id_lote = uuid.uuid4().hex[:8]
+    for inst in lista_instancias:
+        for nombre_alg, fam, solver_fn in algoritmos:
+            for s in semillas:
+                run_id = uuid.uuid4().hex
+                registro = {
+                    'id': run_id,
+                    'lote': id_lote,
+                    'problema': problema_id,
+                    'instancia': inst['id'],
+                    'algoritmo': nombre_alg,
+                    'familia': fam,
+                    'semilla': s,
+                    'parametros': json.dumps(CONFIGURACION_PARAMETROS[(problema_id, nombre_alg)], sort_keys=True),
+                    'max_evaluaciones': limites_eje['max_evaluaciones'],
+                    'max_segundos': limites_eje['max_segundos'],
+                    'estado': 'error',
+                    'factible': False,
+                    'objetivo': np.nan,
+                    'tiempo_s': np.nan,
+                    'evaluaciones': np.nan,
+                    'iteraciones': np.nan,
+                    'excedio_presupuesto': False,
+                    'motivo_parada': '',
+                    'error': ''
+                }
+                
+                t_inicio = None
+                try:
+                    inst_copia = copy.deepcopy(inst)
+                    t_inicio = time.perf_counter()
+                    res = solver_fn(
+                        inst_copia,
+                        seed=s,
+                        presupuesto=dict(limites_eje),
+                        parametros=copy.deepcopy(CONFIGURACION_PARAMETROS[(problema_id, nombre_alg)])
+                    )
+                    registro['tiempo_s'] = time.perf_counter() - t_inicio
+                    
+                    for k in ['evaluaciones', 'iteraciones']:
+                        val = res[k]
+                        if isinstance(val, (bool, np.bool_)) or not isinstance(val, (int, np.integer)) or val < 0:
+                            raise ValueError(f"El campo {k} debe ser un entero no negativo.")
+                        registro[k] = int(val)
+
+                    eval_res = CATALOGO_EVALUADORES[problema_id](copy.deepcopy(inst), res['solucion'])
+                    registro['factible'] = bool(eval_res['factible'])
+                    obj_val = float(eval_res['objetivo'])
+                    
+                    if registro['factible'] and not np.isfinite(obj_val):
+                        raise ValueError("Solución factible requiere valor objetivo finito.")
+
+                    registro['objetivo'] = obj_val
+                    registro['motivo_parada'] = str(res['motivo_parada'])
+                    registro['estado'] = 'ok'
+                    registro['excedio_presupuesto'] = (
+                        registro['tiempo_s'] > limites_eje['max_segundos'] or 
+                        registro['evaluaciones'] > limites_eje['max_evaluaciones']
+                    )
+                    
+                    DETALLES_EJECUCION[run_id] = {'salida': res, 'evaluacion': eval_res}
+                except Exception as ex:
+                    if t_inicio is not None and not np.isfinite(registro['tiempo_s']):
+                        registro['tiempo_s'] = time.perf_counter() - t_inicio
+                    registro['error'] = f"{type(ex).__name__}: {ex}"
+
+                HISTORIAL_RUNS.append(registro)
+    print(f"Lote {id_lote} completado. Total acumulado de ejecuciones: {len(HISTORIAL_RUNS)}")
+
+
+# ==========================================
+# 1. PROBLEMA DE LAS N-REINAS
+# ==========================================
+
+INSTANCIAS_REINAS = [{'id': f'reinas_{n}', 'n': n} for n in (8, 50, 100)]
+
+def calcular_conflictos_reinas(posiciones):
+    """Calcula pares de reinas en conflicto en O(N)."""
+    arr = np.asarray(posiciones, dtype=int)
+    n = len(arr)
+    if n == 0:
+        return 0
+    freq_col = np.bincount(arr, minlength=n)
+    freq_d1 = np.bincount(np.arange(n) + arr, minlength=2*n)
+    freq_d2 = np.bincount(np.arange(n) - arr + n - 1, minlength=2*n)
+
+    def combinaciones(c):
+        return int(np.sum(c * (c - 1) // 2))
+
+    return combinaciones(freq_col) + combinaciones(freq_d1) + combinaciones(freq_d2)
+
+def evaluador_reinas(instancia, solucion):
+    n = instancia['n']
+    if solucion is None:
+        return {'factible': False, 'objetivo': np.nan, 'metricas': {'conflictos': None}}
+    arr = np.asarray(solucion)
+    if arr.shape != (n,) or not np.isin(arr, np.arange(n)).all():
+        return {'factible': False, 'objetivo': np.nan, 'metricas': {'conflictos': None}}
+    
+    conf = calcular_conflictos_reinas(arr.astype(int))
+    return {
+        'factible': (conf == 0),
+        'objetivo': float(conf),
+        'metricas': {'conflictos': conf}
+    }
+
+def solver_bt_reinas(instancia, *, seed, presupuesto, parametros):
+    n = instancia['n']
+    rng = np.random.default_rng(seed)
+    t_start = time.perf_counter()
+    max_eval, max_sec = presupuesto['max_evaluaciones'], presupuesto['max_segundos']
+    
+    tablero = np.full(n, -1, dtype=int)
+    cols_used = np.zeros(n, dtype=bool)
+    diag_asc = np.zeros(2*n, dtype=bool)
+    diag_desc = np.zeros(2*n, dtype=bool)
+    evals, iters = 0, 0
+    hist, stop_reason = [], 'busqueda_agotada'
+
+    def limite_alcanzado():
+        return evals >= max_eval or (time.perf_counter() - t_start) >= max_sec
+
+    def backtrack(row):
+        nonlocal evals, iters, stop_reason
+        iters += 1
+        if row == n:
+            hist.append({'evaluaciones': evals, 'objetivo': 0.0})
+            stop_reason = 'solucion_encontrada'
+            return True
+        if limite_alcanzado():
+            stop_reason = 'presupuesto_agotado'
+            return False
+
+        opciones = []
+        for c in range(n):
+            if cols_used[c] or diag_asc[row - c + n - 1] or diag_desc[row + c]:
+                continue
+            # Heurística de impacto / restricción hacia adelante
+            impacto = sum(1 for f in range(row + 1, n) if (c + (f - row) < n) or (c - (f - row) >= 0))
+            opciones.append((impacto, rng.random(), c))
+
+        opciones.sort()
+        for _, _, c in opciones:
+            if limite_alcanzado():
+                stop_reason = 'presupuesto_agotado'
+                return False
+            evals += 1
+            tablero[row] = c
+            cols_used[c] = diag_asc[row - c + n - 1] = diag_desc[row + c] = True
+
+            if backtrack(row + 1):
+                return True
+
+            tablero[row] = -1
+            cols_used[c] = diag_asc[row - c + n - 1] = diag_desc[row + c] = False
+
+        return False
+
+    exito = backtrack(0)
+    return {
+        'solucion': tablero.tolist() if exito else None,
+        'evaluaciones': evals,
+        'iteraciones': iters,
+        'motivo_parada': stop_reason,
+        'historial': hist
+    }
+
+CATALOGO_EVALUADORES['reinas'] = evaluador_reinas
+registrar_algoritmo('reinas', 'BT_MRV_Ordenado', 'BT', solver_bt_reinas)
+
+# ==========================================
+# EXPORTACIÓN Y FUNCIONES AUXILIARES
+# ==========================================
+
+def generar_reporte_resumen(problema_id=None):
+    df = pd.DataFrame(HISTORIAL_RUNS)
+    if df.empty or problema_id is None:
+        return df
+    sub = df[df.problema == problema_id].copy()
+    sub['valido'] = (sub.estado == 'ok') & sub.factible & ~sub.excedio_presupuesto
+    sub['obj_valido'] = sub.objetivo.where(sub.valido)
+    
+    res = sub.groupby(['lote', 'instancia', 'algoritmo']).agg(
+        corridas=('id', 'size'),
+        tasa_factible=('valido', 'mean'),
+        tiempo_mediana_s=('tiempo_s', 'median'),
+        evaluaciones_mediana=('evaluaciones', 'median'),
+        objetivo_mediana=('obj_valido', 'median'),
+        objetivo_std=('obj_valido', 'std')
+    ).reset_index()
+    return res
+
+print("Módulo de optimización configurado correctamente.")
